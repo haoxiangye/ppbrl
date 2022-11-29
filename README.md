@@ -1,3 +1,4 @@
 # ppbrl
-The code of the paper BYZANTINE-ROBUST AND PRIVACY-PRESERVING DECENTRALIZED MACHINE LEARNING.
+This is code of the paper On the Tradeoff between Privacy Preservation and Byzantine-Robustness in Decentralized Learning.
 
+#install
