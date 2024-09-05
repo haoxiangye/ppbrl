@@ -5,7 +5,7 @@ from ByrdLab.library import dataset
 from ByrdLab.library.dataset import EmptySet
 from ByrdLab.DistributedModule import DistributedModule
 from ByrdLab.library.partition import EmptyPartition
-
+from opacus.grad_sample import GradSampleModule
 from .library.measurements import avg_loss_accuracy_dec, consensus_error
 from .library.tool import log
 
@@ -82,40 +82,57 @@ class DSGD(DecentralizedByzantineEnvironment):
             for node in self.graph.honest_nodes:
                 dist_models.activate_model(node)
                 model = dist_models.model
+                _model = GradSampleModule(model)
                 features, targets = next(data_iters[node])
                 predictions = model(features)
                 loss = self.loss_fn(predictions, targets)
                 model.zero_grad()
                 loss.backward()
-                
-                # record loss
-                # train_loss += loss.item()
-                # train_loss += self.weight_decay / 2 * dist_models.norm(node)**2
-                # TODO: correct prediction_cls
-                # _, prediction_cls = torch.max(predictions.detach(), dim=1)
-                # train_accuracy += (prediction_cls == targets).sum().item()
-                # total_sample += len(targets)
-                # total_sample += 1
+                #添加clip样本梯度的部分
+                sample_grads = [x.grad_sample for x in _model.parameters()]
+                grad_square = [x.square().view(x.shape[0], -1).sum(dim=1) for x in sample_grads]
+                grad_norm = torch.sqrt(torch.stack(grad_square, dim=1).sum(dim=1))
+                sample_factors = torch.div(1, grad_norm).clamp(max=1.0)
+                clip_grad = []
+                for grad in sample_grads:
+                    factor = sample_factors.reshape(sample_factors.shape + (1,) * (grad.dim() - 1))
+                    grad.detach().mul_(factor)
+                    clip_grad.append(grad.mean(dim=0).data.reshape(-1))
+                clip_grad = torch.cat(clip_grad)
+                _model.to_standard_module()
+
                 
                 # gradient descend
+                # with torch.no_grad():
+                #     for param in model.parameters():
+                #         if param.grad is not None:
+                #             param.data.mul_(1 - self.weight_decay * lr)
+                #             param.data.sub_(param.grad, alpha=lr)
+                #使用clip后的梯度来做梯度下降
                 with torch.no_grad():
-                    for param in model.parameters():
+                    start_idx = 0
+                    for param in self.model.parameters():
                         if param.grad is not None:
+                            end_idx = start_idx + param.numel()
+                            param_clip_grad = clip_grad[start_idx:end_idx].reshape(param.shape)
                             param.data.mul_(1 - self.weight_decay * lr)
-                            param.data.sub_(param.grad, alpha=lr)
+                            param.data.sub_(param_clip_grad, alpha=lr)
+                            start_idx = end_idx
             # store the parameters before communication
             param_bf_comm.copy_(dist_models.params_vec)
-                            
+            # gaussian_noise = torch.randn_like(param_bf_comm) * 0.5 * lr
+            # param_bf_comm = param_bf_comm + gaussian_noise
             # communication and attack
             self.aggregation.global_state['lr'] = lr
             for node in self.graph.honest_nodes:
                 # Byzantine attack
+                gaussian_noise = torch.randn_like(param_bf_comm) * 0.2 * lr
                 byzantine_neighbors_size = self.graph.byzantine_sizes[node]
                 if self.attack != None and byzantine_neighbors_size != 0:
                     self.attack.run(param_bf_comm, node)
                 # aggregation
-                gaussian_noise = torch.randn_like(param_bf_comm)*2*lr
-                aggregation_res = self.aggregation.run(param_bf_comm+gaussian_noise , node)
+                # aggregation_res = self.aggregation.run(param_bf_comm, node)
+                aggregation_res = self.aggregation.run(param_bf_comm+gaussian_noise, node)
                 dist_models.params_vec[node].copy_(aggregation_res)
                 
         dist_models.activate_avg_model()
